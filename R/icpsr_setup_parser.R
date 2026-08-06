@@ -214,15 +214,40 @@ parse_value_labels <- function(lines) {
 
 # --- MISSING VALUES -----------------------------------------------------------
 
-#' @return named list: variable name -> numeric vector of missing codes
+#' @return named list: variable name ->
+#'           list(codes  = numeric vector of enumerated missing codes,
+#'                ranges = list of c(lo, hi) intervals, -Inf/Inf for open ends)
 #'
-#' Only enumerated codes -- V5 (8,9) -- are captured. Range forms such as
-#' (LO THRU -1) are reported to the caller rather than silently dropped, since
-#' ignoring a range would leave real missing codes sitting in the data as though
-#' they were valid responses.
+#' Handles both spec forms that occur in ICPSR files:
+#'   V3 (998,999)               enumerated codes
+#'   V14 (0000008 THRU HI)      range; also LO THRU n, and n THRU m
+#'   V10 (0000009 THRU HI, 0)   mixed
+#'
+#' ICPSR ships many legacy setup files with this block deliberately commented
+#' out ("* MISSING VALUES ..."), leaving the choice of applying it to the
+#' researcher. When no active block exists, that commented block is parsed
+#' instead -- only the header line carries the "*"; the continuation lines are
+#' plain text, so only the keyword search needs to tolerate the comment marker.
+#' The result carries attr "source" = "active" or "commented" so scripts can
+#' report which one they used. Applying the rules remains a separate, explicit
+#' step (scripts/02_recode_missing.R); parsing them loses nothing.
 parse_missing_values <- function(lines) {
   block <- strip_noise(extract_block(lines, "MISSING\\s+VALUES"))
-  if (length(block) == 0) return(list())
+  src <- "active"
+  if (length(block) == 0) {
+    starts <- grep("^\\s*\\*\\s*MISSING\\s+VALUES\\s*$", lines, ignore.case = TRUE)
+    if (length(starts) == 0) return(list())
+    start <- starts[1]
+    end <- length(lines)
+    for (j in start:length(lines)) {
+      if (grepl("\\.\\s*$", mask_quoted(lines[j]))) { end <- j; break }
+    }
+    block <- lines[(start + 1):end]  # drop the "* MISSING VALUES" header itself
+    block <- block[!grepl("^\\s*$", block)]
+    src <- "commented"
+    if (length(block) == 0) return(list())
+  }
+
   joined <- paste(block, collapse = "\n")
   joined <- sub("\\.\\s*$", "", joined)
 
@@ -234,26 +259,50 @@ parse_missing_values <- function(lines) {
   parts <- regmatches(hits, regexec(pat, hits, perl = TRUE))
   out <- list()
   unparsed <- character(0)
+  num <- function(s) suppressWarnings(as.numeric(s))
 
   for (p in parts) {
     v <- toupper(p[2])
-    spec <- trimws(p[3])
+    codes <- numeric(0)
+    ranges <- list()
 
-    if (grepl("THRU|LO|HI", spec, ignore.case = TRUE)) {
-      unparsed <- c(unparsed, paste0(v, " (", spec, ")"))
-      next
+    # A spec is a comma-separated list; each item is a code or one range.
+    for (item in strsplit(trimws(p[3]), ",")[[1]]) {
+      item <- trimws(item)
+      if (!nzchar(item)) next
+
+      if (grepl("THRU", item, ignore.case = TRUE)) {
+        side <- trimws(strsplit(item, "THRU", fixed = FALSE)[[1]])
+        side <- trimws(sub("(?i)thru", "", side, perl = TRUE))
+        lo_txt <- toupper(side[1]); hi_txt <- toupper(side[2])
+        lo <- if (lo_txt %in% c("LO", "LOWEST")) -Inf else num(lo_txt)
+        hi <- if (hi_txt %in% c("HI", "HIGHEST")) Inf else num(hi_txt)
+        if (is.na(lo) || is.na(hi)) {
+          unparsed <- c(unparsed, paste0(v, " (", item, ")"))
+          next
+        }
+        ranges[[length(ranges) + 1L]] <- c(lo, hi)
+      } else {
+        val <- num(item)
+        if (is.na(val)) {
+          unparsed <- c(unparsed, paste0(v, " (", item, ")"))
+          next
+        }
+        codes <- c(codes, val)
+      }
     }
-    codes <- suppressWarnings(as.numeric(strsplit(spec, "[[:space:],]+")[[1]]))
-    codes <- codes[!is.na(codes)]
-    if (length(codes) > 0) out[[v]] <- codes
+
+    if (length(codes) > 0 || length(ranges) > 0) {
+      out[[v]] <- list(codes = codes, ranges = ranges)
+    }
   }
 
+  attr(out, "source") <- src
   if (length(unparsed) > 0) {
-    attr(out, "unparsed_ranges") <- unparsed
+    attr(out, "unparsed") <- unparsed
     warning(
-      length(unparsed), " MISSING VALUES specification(s) use THRU/LO/HI ranges ",
-      "and were not parsed. Handle these by hand in scripts/02_recode_missing.R:\n  ",
-      paste(utils::head(unparsed, 10), collapse = "\n  "),
+      length(unparsed), " MISSING VALUES item(s) could not be parsed and were ",
+      "skipped:\n  ", paste(utils::head(unparsed, 10), collapse = "\n  "),
       call. = FALSE
     )
   }
@@ -315,7 +364,10 @@ read_icpsr_ascii <- function(data_file, setup_file, apply_value_labels = TRUE) {
   for (v in names(df)) {
     if (v %in% names(var_labs)) attr(df[[v]], "label") <- unname(var_labs[[v]])
     if (v %in% names(val_labs)) attr(df[[v]], "value_labels") <- val_labs[[v]]
-    if (v %in% names(miss))     attr(df[[v]], "na_values") <- miss[[v]]
+    if (v %in% names(miss)) {
+      attr(df[[v]], "na_values") <- miss[[v]]$codes
+      attr(df[[v]], "na_ranges") <- miss[[v]]$ranges
+    }
   }
 
   if (apply_value_labels) df <- apply_value_labels_as_factors(df)
@@ -355,6 +407,7 @@ apply_value_labels_as_factors <- function(df) {
 
     keep_label <- attr(df[[v]], "label")
     keep_na    <- attr(df[[v]], "na_values")
+    keep_rng   <- attr(df[[v]], "na_ranges")
 
     df[[v]] <- factor(as.character(df[[v]]),
                       levels = names(match_vl),
@@ -365,6 +418,7 @@ apply_value_labels_as_factors <- function(df) {
     attr(df[[v]], "label") <- keep_label
     attr(df[[v]], "value_labels") <- vl
     attr(df[[v]], "na_values") <- keep_na
+    attr(df[[v]], "na_ranges") <- keep_rng
     converted <- converted + 1L
   }
   message("Applied value labels as factors to ", converted, " variable(s).")

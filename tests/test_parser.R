@@ -197,25 +197,43 @@ check("zero-padded codes preserved as written",
       sort(names(vals[["V9"]])), c("01", "02"))
 
 section("MISSING VALUES")
-miss <- withCallingHandlers(
-  parse_missing_values(setup_lines),
-  warning = function(w) invokeRestart("muffleWarning")
-)
-check("4 enumerated rules parsed", length(miss), 4L)
-check("single code", unname(miss[["V1"]]), 99)
-check("multiple codes", unname(miss[["V3"]]), c(998, 999))
-check("V5 codes", unname(miss[["V5"]]), c(8, 9))
-check("THRU range not silently swallowed as a code",
-      is.null(miss[["V4"]]), TRUE)
-check("THRU range reported on the attribute",
-      attr(miss, "unparsed_ranges"), "V4 (LO THRU -1)")
+miss <- parse_missing_values(setup_lines)
+check("5 rules parsed (ranges now included)", length(miss), 5L)
+check("single code", miss[["V1"]]$codes, 99)
+check("multiple codes", miss[["V3"]]$codes, c(998, 999))
+check("V5 codes", miss[["V5"]]$codes, c(8, 9))
+check("LO THRU n parsed as a range", miss[["V4"]]$ranges, list(c(-Inf, -1)))
+check("active block reports source", attr(miss, "source"), "active")
+check("nothing unparsed in this fixture", is.null(attr(miss, "unparsed")), TRUE)
 
-got_warning <- FALSE
-invisible(withCallingHandlers(
-  parse_missing_values(setup_lines),
-  warning = function(w) { got_warning <<- TRUE; invokeRestart("muffleWarning") }
-))
-check("THRU range raises a warning", got_warning, TRUE)
+# The forms the real ICPSR 7223 file uses: a commented-out block header
+# (ICPSR's opt-in convention), zero-padded THRU HI ranges, and mixed specs.
+icpsr_style <- c(
+  "* SPSS MISSING VALUES COMMAND.",
+  "",
+  "* MISSING VALUES",
+  "   V5 (0000099 THRU HI)                V10 (0000009 THRU HI, 0000000)",
+  "   V14 (0000008 THRU HI)               V455 (0000000)",
+  "   V476 (0000995 THRU HI)              V90 (1 THRU 5) ."
+)
+m2 <- parse_missing_values(icpsr_style)
+check("commented block found via fallback", attr(m2, "source"), "commented")
+check("6 variables parsed from commented block", length(m2), 6L)
+check("n THRU HI becomes [n, Inf)", m2[["V14"]]$ranges, list(c(8, Inf)))
+check("zero-padded threshold read numerically", m2[["V5"]]$ranges, list(c(99, Inf)))
+check("mixed spec: range and enumerated 0 both kept",
+      list(m2[["V10"]]$ranges, m2[["V10"]]$codes), list(list(c(9, Inf)), 0))
+check("bare 0 kept as enumerated code", m2[["V455"]]$codes, 0)
+check("995 THRU HI", m2[["V476"]]$ranges, list(c(995, Inf)))
+check("bounded n THRU m range", m2[["V90"]]$ranges, list(c(1, 5)))
+
+# An ACTIVE block must win over a commented one earlier in the file.
+both <- c("* MISSING VALUES", "   V1 (0000008 THRU HI) .",
+          "MISSING VALUES", "   V2 (7) .")
+m3 <- parse_missing_values(both)
+check("active block preferred over commented", attr(m3, "source"), "active")
+check("only the active block's rules kept",
+      list(names(m3), m3[["V2"]]$codes), list("V2", 7))
 
 # --- end-to-end round trip ----------------------------------------------------
 
@@ -242,6 +260,7 @@ check("V8 round-trips", bare(df$V8), as.numeric(truth$V8))
 
 check("variable label attached", attr(df$V3, "label"), "MONTHLY FAMILY INCOME (NT$)")
 check("missing codes attached", attr(df$V3, "na_values"), c(998, 999))
+check("missing ranges attached", attr(df$V4, "na_ranges"), list(c(-Inf, -1)))
 check("no missing codes attached where none declared",
       is.null(attr(df$CASEID, "na_values")), TRUE)
 

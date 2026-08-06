@@ -74,64 +74,76 @@ attr(taiwan$V1, "label")   # variable labels survive the round trip
 | File | Purpose |
 |---|---|
 | `scripts/01_load_icpsr.R` | Unpacks the bundle, works out what format it holds, reads it, saves `..._raw.rds` and `docs/variable_inventory.csv`. Leaves missing codes as-is. |
-| `scripts/02_recode_missing.R` | Applies the declared missing-value codes. **Contains the one decision you should review** — see below. Saves the analysis file and `docs/missing_value_report.csv`. |
+| `scripts/02_recode_missing.R` | Applies the declared missing-value codes. Classifies and applies the study's missing codes — see the policy section. Saves the analysis file and `docs/missing_value_report.csv`. |
 | `R/icpsr_setup_parser.R` | Parser for legacy SPSS setup files. Used only when the bundle has no ready-made data file. |
-| `tests/test_parser.R` | 55 tests for the parser. No network or ICPSR access needed. |
+| `tests/test_parser.R` | 66 tests for the parser. No network or ICPSR access needed. |
 
 `01` dispatches on bundle contents rather than assuming a layout: it handles
 `.rda`, `.sav`, `.dta`, `.sas7bdat`, and the legacy ASCII-plus-setup pairing,
 and it accepts a `.zip`, an already-extracted folder, or a nested zip.
 
-## The decision worth reviewing
+## The missing-value policy
 
-`scripts/02_recode_missing.R` distinguishes two kinds of non-answer:
+`scripts/02_recode_missing.R` classifies every declared missing rule as
+**inapplicable** (`0`, "Inap." — a filter routed the respondent past the
+question), **nonresponse** (8 "D.K.", 9 "N.A." — asked, no usable answer), or
+**range** (a per-variable `THRU HI` tail mixing both kinds).
 
-- **Inapplicable** (usually 8/98/998) — a filter routed the respondent past the
-  question. It was never asked.
-- **Nonresponse** (usually 9/99/999) — asked, but no usable answer.
-
-Collapsing both to `NA` means listwise deletion drops people who were never
-asked, which can remove a whole subgroup. The default here sets nonresponse to
-`NA` and keeps inapplicable as a distinct value. Both are one-line switches
-(`NA_FOR_INAPPLICABLE`, `NA_FOR_NONRESPONSE`), and the classification rule
-carries a `TODO` to check against the codebook — in particular whether this
-study uses `0` for inapplicable, as some 1970s studies do.
-
-Every change is logged to `docs/missing_value_report.csv`, so the effect of the
-policy is auditable rather than invisible.
+The default sets **all three to `NA`**. This study has no value labels, so every
+variable is numeric — a missing code left visible sits inside every mean and
+correlation unnoticed. The trade-off is that listwise deletion will drop
+respondents who were never asked a question; for filter-aware analyses, the
+unrecoded codes are all still in `..._raw.rds`, and every blanked cell is logged
+in `docs/missing_value_report.csv` (rule, class, count, variable). Three
+one-line switches (`NA_FOR_INAPPLICABLE`, `NA_FOR_NONRESPONSE`,
+`NA_FOR_RANGES`) change the policy without touching the classification.
 
 ## Verification status
 
-Please read this before relying on the output.
+**Verified against the real ICPSR download (2026-08-05).** The conversion was
+run on the actual `ICPSR_07223-V1.zip` and checked structurally:
 
-**Tested.** The parser has 55 passing tests, run under R 4.5.3 with readr 2.2.0.
-They cover column positions, implied decimals, variable and value labels,
-missing-value rules, and a full round trip from known values through a
-fixed-width file and back. The fixtures deliberately include the constructs that
-break naive parsers: an apostrophe inside a double-quoted label (`"DON'T KNOW"`),
-a slash inside a label (`"AGREE/STRONGLY AGREE"`), a period inside a label, one
-label set shared across two variables, zero-padded value codes, and a
-`LO THRU -1` range. The loader was exercised end-to-end against synthetic
-bundles in all five of its dispatch paths, plus the error path.
+- **2,222 rows** — 1,882 cross-section + the 340-case Hsien stratum, exactly
+  as the study description documents.
+- **V3 (sample stratum)**: stratum 5 holds exactly 340 cases; the other five
+  strata sum to 1,882.
+- **V4 (sample weights)**: the 340 Hsien cases carry weight 0 (excluded from
+  weighted cross-section analyses), and each weight's frequency matches its
+  stratum's size. This also confirms the implied-decimal handling — weights
+  land near 1.0, not 100.
+- **V2 (interview number)**: runs 1–2222 with no duplicates.
+- All **479 variables** parsed with all 479 labels attached.
 
-**Not tested.** None of this has been run against the real ICPSR 7223 download,
-because that requires an authenticated account. The first real run should be
-treated as a check, not a formality:
+Three independent variables agreeing with the documented design is not
+survivable by a misaligned fixed-width read.
 
-- `01` warns if the row count is not 1,882 or 2,222. **A misparsed fixed-width
-  layout usually shows up first as a wrong row count** — do not dismiss that
-  warning.
-- Compare `docs/variable_inventory.csv` against the codebook PDF. Variable
-  count, names and labels should line up exactly.
-- Spot-check a few frequency distributions against the codebook's marginals.
-  Off-by-one column errors produce plausible-looking but wrong numbers, and a
-  marginal check is the cheapest way to catch them.
+The parser also has 66 passing tests (R 4.5.3, readr 2.2.0) covering column
+positions, implied decimals, labels, missing-value rules — including the forms
+the real file uses: a commented-out `MISSING VALUES` block, zero-padded
+`THRU HI` ranges, and mixed range-plus-code specs — and a full round trip from
+known values through a fixed-width file and back.
 
-**Known limits.** `MISSING VALUES` ranges of the form `(LO THRU n)` are reported
-but not applied — the script warns and lists them for manual handling. Only the
-first dataset is read if a bundle contains several, and it warns when that
-happens. `RECODE` and `COMPUTE` statements, which appear in a few ICPSR setup
-files, are ignored.
+**What the real file taught us** (all handled, all worth knowing):
+
+- The setup file has **no `VALUE LABELS` section**. Category meanings live only
+  in the codebook PDF (`data/raw/extracted/ICPSR_07223/DS0001/`), so all 479
+  variables come through numeric, labelled at the variable level only.
+- The `MISSING VALUES` block ships **commented out** — ICPSR's convention for
+  leaving the choice to the researcher. The parser reads it anyway and records
+  `source = "commented"`; applying it is `02`'s explicit, logged act.
+- Missing rules are almost all **per-variable `THRU HI` ranges** with sixteen
+  distinct thresholds (4 through 1251). The tails mix D.K./N.A. with structural
+  skip codes — `55. Had no contact` on the credit-union battery, for example —
+  so ranges get their own class in the report rather than a guessed
+  inapplicable/nonresponse split.
+- Enumerated `0` ("Inap.") appears on 180 variables — the codebook confirms 0
+  is this study's inapplicable code.
+
+**Known limits.** Only the first dataset is read if a bundle contains several
+(with a warning). `RECODE` and `COMPUTE` statements in setup files are ignored.
+The inapplicable-vs-nonresponse split inside a `THRU HI` range is not attempted
+— refining it for a specific battery means reading that battery's codebook page
+and adjusting `classify_missing_code()`.
 
 ## Citation
 

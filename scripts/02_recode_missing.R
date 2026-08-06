@@ -38,61 +38,62 @@ message("Loaded ", nrow(taiwan), " rows x ", ncol(taiwan), " variables.")
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
 # ==============================================================================
-# DECISION POINT - classify_missing_code()
+# CLASSIFICATION - verified against the ICPSR 7223 codebook, 2026-08-05
 # ==============================================================================
 #
-# ICPSR studies of this era distinguish two kinds of non-answer, and they are
-# not interchangeable:
+# ICPSR studies of this era distinguish two kinds of non-answer:
 #
-#   INAPPLICABLE   The question was never asked of this respondent - a filter or
-#                  skip pattern routed them past it. Codes are usually 8, 98,
-#                  998, labelled "INAPPROPRIATE", "NOT APPLICABLE", "NA", or
-#                  "LEGITIMATE SKIP". Being inapplicable is a fact about the
-#                  questionnaire, not about the respondent.
-#
-#   NONRESPONSE    The question was asked and no usable answer came back. Codes
-#                  are usually 9, 99, 999, labelled "NO ANSWER", "DON'T KNOW",
-#                  "REFUSED", "NOT ASCERTAINED".
+#   INAPPLICABLE   The question was never asked of this respondent - a filter
+#                  or skip pattern routed them past it.
+#   NONRESPONSE    The question was asked and no usable answer came back.
 #
 # The distinction drives what happens in analysis. Setting both to NA means
 # listwise deletion drops respondents who were never asked the question, which
-# can remove an entire subgroup - for this study, the rural/urban and religious
-# filters are the likely places that bites. Keeping "inapplicable" as its own
-# level preserves those cases but requires every downstream model to handle a
-# factor level that is not a substantive response.
+# can remove an entire subgroup. Keeping "inapplicable" visible preserves those
+# cases but every downstream model must handle the extra level.
 #
-# Which way to go is a judgment about this codebook and your analysis, so the
-# rule below is left for you rather than guessed at. It receives one missing
-# code and the value label attached to it, and returns one of:
-#   "inapplicable", "nonresponse", or "keep" (do not treat as missing at all).
+# What the 7223 codebook and setup file actually use (verified 2026-08-05):
+#   0     "Inap."      enumerated on 180 variables      -> INAPPLICABLE
+#   8/9   "D.K."/"N.A." (134 and 108 codebook entries)  -> NONRESPONSE
+#   THRU HI ranges     454 rules, with per-variable thresholds of
+#         4,5,6,7,8,9,14,18,55,66,77,88,90,99,995,1251. These tails mix
+#         D.K./N.A. with structural skip codes ("55. Had no contact"), and
+#         only the codebook can split them per battery -> class "range"
 #
-# The default below classifies on the label text and falls back to the numeric
-# convention. Adjust it after reading the codebook PDF - in particular, check
-# whether this study uses 0 for inapplicable, which some 1970s studies do and
-# which the numeric fallback below would misread as a substantive value.
+# Caution that shaped this design: 8 and 9 are SUBSTANTIVE on many variables
+# ("8. Other", "9. All nine relationships"). A blanket 8/9 rule would destroy
+# real data. Only the per-variable rules in the setup file are applied; the
+# classification below only decides which KIND of missing each rule is.
+#
+# The setup file ships its MISSING VALUES block commented out - ICPSR's way of
+# leaving the choice to the researcher. The parser reads it anyway and records
+# source = "commented"; applying it is this script's explicit job.
 
-classify_missing_code <- function(code, label) {
-  # TODO(Ron): adjust to match the ICPSR 7223 codebook.
+classify_missing_code <- function(code, label, is_range = FALSE) {
+  if (is_range) return("range")
   lab <- toupper(as.character(label %||% ""))
-
-  if (grepl("INAPPROP|NOT APPLICABLE|^NA$|LEGITIMATE SKIP|NOT ASKED", lab)) {
+  if (grepl("INAP|NOT APPLICABLE|LEGITIMATE SKIP|NOT ASKED|NO CONTACT", lab)) {
     return("inapplicable")
   }
-  if (grepl("NO ANSWER|DON'T KNOW|DONT KNOW|REFUS|NOT ASCERTAINED|UNKNOWN", lab)) {
+  if (grepl("NO ANSWER|DON'T KNOW|DONT KNOW|D\\.K\\.|N\\.A\\.|REFUS|NOT ASCERTAINED", lab)) {
     return("nonresponse")
   }
-  # Fallback when a code carries no label: the 8/98/998 vs 9/99/999 convention.
-  if (code %in% c(8, 98, 998, 9998)) return("inapplicable")
-  if (code %in% c(9, 99, 999, 9999)) return("nonresponse")
-  "nonresponse"
+  # This study has no VALUE LABELS section, so classification rests on the
+  # verified numeric conventions.
+  if (!is.na(code) && code == 0) return("inapplicable")   # "0. Inap."
+  "nonresponse"                                            # 8=D.K., 9=N.A.
 }
 
-# How each class is handled. Change these two to change the policy without
-# touching the classification rule above.
-#   TRUE  -> becomes NA
-#   FALSE -> kept as a distinct, visible value
-NA_FOR_INAPPLICABLE <- FALSE
+# Policy: what becomes NA. Default is TRUE across the board, deliberately:
+# this study has no value labels, so every variable is numeric, and a kept
+# missing code sits inside every mean and correlation unnoticed. The *_raw.rds
+# keeps all original codes, and docs/missing_value_report.csv records exactly
+# what was blanked where, so filter-aware analyses (who was routed past a
+# question) reconstruct anything they need from those two.
+#   Flip a switch to FALSE to keep that class visible instead.
+NA_FOR_INAPPLICABLE <- TRUE
 NA_FOR_NONRESPONSE  <- TRUE
+NA_FOR_RANGES       <- TRUE
 
 # ==============================================================================
 
@@ -105,22 +106,36 @@ recode_missing <- function(df) {
   report <- list()
 
   for (v in names(df)) {
-    codes <- attr(df[[v]], "na_values")
-    if (is.null(codes) || length(codes) == 0) next
+    codes  <- attr(df[[v]], "na_values")
+    ranges <- attr(df[[v]], "na_ranges")
+    if ((is.null(codes) || length(codes) == 0) &&
+        (is.null(ranges) || length(ranges) == 0)) next
 
     labs <- attr(df[[v]], "value_labels")
     x <- df[[v]]
     is_fac <- is.factor(x)
 
-    keep_attrs <- attributes(x)[c("label", "value_labels", "na_values")]
+    keep_attrs <- attributes(x)[c("label", "value_labels", "na_values", "na_ranges")]
+
+    apply_rule <- function(hits, code, lab, rule_txt, is_range = FALSE) {
+      cls <- classify_missing_code(code, lab, is_range)
+      to_na <- (cls == "inapplicable" && NA_FOR_INAPPLICABLE) ||
+               (cls == "nonresponse"  && NA_FOR_NONRESPONSE) ||
+               (cls == "range"        && NA_FOR_RANGES)
+      n <- sum(hits)
+      if (n > 0) {
+        if (to_na) x[hits] <<- NA
+        report[[length(report) + 1L]] <<- data.frame(
+          variable = v, rule = rule_txt,
+          label = as.character(lab %||% NA_character_),
+          class = cls, n = n, set_na = to_na,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
 
     for (code in codes) {
       lab <- if (!is.null(labs)) labs[[as.character(code)]] else NULL
-      cls <- classify_missing_code(code, lab)
-
-      to_na <- (cls == "inapplicable" && NA_FOR_INAPPLICABLE) ||
-               (cls == "nonresponse"  && NA_FOR_NONRESPONSE)
-
       # A factor stores the decoded label, so match on the label; a numeric
       # column still holds the raw code.
       hits <- if (is_fac) {
@@ -128,17 +143,17 @@ recode_missing <- function(df) {
       } else {
         !is.na(x) & x == code
       }
-      n <- sum(hits)
-      if (n == 0) next
+      apply_rule(hits, code, lab, as.character(code))
+    }
 
-      if (to_na) x[hits] <- NA
-
-      report[[length(report) + 1L]] <- data.frame(
-        variable = v, code = code,
-        label = as.character(lab %||% NA_character_),
-        class = cls, n = n, set_na = to_na,
-        stringsAsFactors = FALSE
-      )
+    # Ranges only make sense against numeric values.
+    if (!is_fac && !is.null(ranges)) {
+      for (r in ranges) {
+        hits <- !is.na(x) & x >= r[1] & x <= r[2]
+        rule_txt <- paste0("[", if (is.infinite(r[1])) "LO" else r[1], " THRU ",
+                           if (is.infinite(r[2])) "HI" else r[2], "]")
+        apply_rule(hits, r[1], NULL, rule_txt, is_range = TRUE)
+      }
     }
 
     if (is_fac) x <- droplevels(x)
@@ -149,7 +164,7 @@ recode_missing <- function(df) {
   }
 
   rep_df <- if (length(report) > 0) do.call(rbind, report) else
-    data.frame(variable = character(0), code = numeric(0), label = character(0),
+    data.frame(variable = character(0), rule = character(0), label = character(0),
                class = character(0), n = integer(0), set_na = logical(0))
   attr(df, "missing_report") <- rep_df
   df
@@ -171,6 +186,8 @@ if (nrow(report) == 0) {
           if (NA_FOR_INAPPLICABLE) "NA" else "kept as a distinct value")
   message("          nonresponse  -> ",
           if (NA_FOR_NONRESPONSE) "NA" else "kept as a distinct value")
+  message("          range rules  -> ",
+          if (NA_FOR_RANGES) "NA" else "kept as distinct values")
   message("  ", nrow(report), " code(s) across ",
           length(unique(report$variable)), " variable(s); ",
           sum(report$n[report$set_na]), " cell(s) set to NA")
