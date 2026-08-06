@@ -41,6 +41,15 @@ the person downloading. Do this by hand:
 ## Running it
 
 ```bash
+./run.sh
+```
+
+`run.sh` locates R for you — on `PATH`, in a conda/micromamba environment, or in
+the macOS framework build — so you do not have to activate anything first. Use
+`./run.sh 01`, `./run.sh 02` or `./run.sh tests` to run one step. If you would
+rather call R directly:
+
+```bash
 Rscript scripts/01_load_icpsr.R
 Rscript scripts/02_recode_missing.R
 ```
