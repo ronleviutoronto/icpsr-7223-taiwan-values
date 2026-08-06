@@ -1,0 +1,14 @@
+# ICPSR content is not redistributable — each user downloads it under their own
+# credentials. Keep the folder structure, not the data.
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Generated from the data, so regenerable and study-content-bearing.
+docs/variable_inventory.csv
+docs/missing_value_report.csv
+
+.Rhistory
+.RData
+.Rproj.user/
